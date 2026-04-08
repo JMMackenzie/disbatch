@@ -1,0 +1,686 @@
+diff --git a/include/pisa/query.hpp b/include/pisa/query.hpp
+index cae56457..07703256 100644
+--- a/include/pisa/query.hpp
++++ b/include/pisa/query.hpp
+@@ -166,11 +166,17 @@ class Query {
+     )
+         : Query(std::move(id), terms.begin(), terms.end(), policy) {}
+ 
++    /** Return a string representation of the terms */
++    [[nodiscard]] auto to_string() const noexcept -> std::string;
++
+     /** Returns the ID of the query if defined. */
+     [[nodiscard]] auto id() const noexcept -> std::optional<std::string_view>;
+ 
+     /** Returns the reference to all weighted terms. */
+     [[nodiscard]] auto terms() const noexcept -> std::vector<WeightedTerm> const&;
++
++    [[nodiscard]] auto term_ids() const noexcept -> std::vector<TermId>;
++ 
+ };
+ 
+ }  // namespace pisa
+diff --git a/src/query.cpp b/src/query.cpp
+index 58b1348f..a9b46c6a 100644
+--- a/src/query.cpp
++++ b/src/query.cpp
+@@ -42,6 +42,26 @@ auto Query::terms() const noexcept -> std::vector<WeightedTerm> const& {
+     return m_terms;
+ }
+ 
++auto Query::term_ids() const noexcept -> std::vector<TermId> {
++    std::vector<TermId> term_ids;
++    for (size_t i = 0; i < m_terms.size(); ++i) {
++        term_ids.push_back(m_terms[i].id);
++    }
++    return term_ids;
++}
++
++auto Query::to_string() const noexcept -> std::string {
++    if (m_terms.size() <= 0) {
++        return "";
++    }
++    std::string q = std::to_string(m_terms[0].id);
++    for (size_t i = 1; i < m_terms.size(); ++i) {
++        q += " " + std::to_string(m_terms[i].id);
++    }
++    return q;
++}
++
++
+ /** The first occurrence of each term is assigned the accumulated weight. */
+ void accumulate_weights(std::vector<WeightedTerm>& terms) {
+     std::unordered_map<TermId, decltype(terms.begin())> positions;
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 6a6a2229..a736562c 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -10,6 +10,7 @@ target_link_libraries(app pisa CLI11 nlohmann_json::nlohmann_json)
+ add_tool(compress_inverted_index compress_inverted_index.cpp)
+ add_tool(create_wand_data create_wand_data.cpp)
+ add_tool(queries queries.cpp)
++add_tool(batch_queries batch_queries.cpp)
+ add_tool(evaluate_queries evaluate_queries.cpp)
+ add_tool(thresholds thresholds.cpp)
+ add_tool(profile_queries profile_queries.cpp)
+diff --git a/tools/batch_queries.cpp b/tools/batch_queries.cpp
+new file mode 100644
+index 00000000..e6580f2f
+--- /dev/null
++++ b/tools/batch_queries.cpp
+@@ -0,0 +1,615 @@
++// Copyright 2025 PISA Developers
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <algorithm>
++#include <fstream>
++#include <iostream>
++#include <numeric>
++#include <optional>
++#include <string>
++
++#include <CLI/CLI.hpp>
++#include <nlohmann/json.hpp>
++#include <range/v3/view/enumerate.hpp>
++#include <spdlog/sinks/null_sink.h>
++#include <spdlog/sinks/stdout_color_sinks.h>
++#include <spdlog/spdlog.h>
++
++#include "accumulator/lazy_accumulator.hpp"
++#include "accumulator/simple_accumulator.hpp"
++#include "app.hpp"
++#include "cursor/block_max_scored_cursor.hpp"
++#include "cursor/cursor.hpp"
++#include "cursor/max_scored_cursor.hpp"
++#include "cursor/scored_cursor.hpp"
++#include "index_types.hpp"
++#include "memory_source.hpp"
++#include "query/algorithm/and_query.hpp"
++#include "query/algorithm/block_max_maxscore_query.hpp"
++#include "query/algorithm/block_max_ranked_and_query.hpp"
++#include "query/algorithm/block_max_wand_query.hpp"
++#include "query/algorithm/maxscore_query.hpp"
++#include "query/algorithm/or_query.hpp"
++#include "query/algorithm/ranked_and_query.hpp"
++#include "query/algorithm/ranked_or_query.hpp"
++#include "query/algorithm/ranked_or_taat_query.hpp"
++#include "query/algorithm/wand_query.hpp"
++#include "scorer/scorer.hpp"
++#include "timer.hpp"
++#include "topk_queue.hpp"
++#include "type_alias.hpp"
++#include "util/do_not_optimize_away.hpp"
++#include "wand_data.hpp"
++#include "wand_data_compressed.hpp"
++#include "wand_data_raw.hpp"
++
++using namespace pisa;
++using ranges::views::enumerate;
++
++// ********************************************************************************************************************
++// The following snippets are adapted from the original work of Yafay and Altingovde
++// https://github.com/yfy-/Quant-BM-WAND/blob/master/src/lowerbound_threshold.cpp
++// Caching Scores for Faster Query Processing with Dynamic Pruning in Search Engines
++// CIKM 2019
++
++
++// Given a vector of subsets, examine the cache for all of them
++// and update `max_threshold` to the maximum one. Return true if we
++// updated; false otherwise.
++bool subset_max_exists(const std::vector<std::string>& subsets,
++                       Score& max_threshold,
++                       const std::unordered_map<std::string, Score>& cache) {
++  bool exists = false;
++
++  for (const auto& s : subsets) {
++    bool in_cache = cache.find(s) != cache.end();
++
++    if (in_cache) {
++      exists = true;
++      Score threshold = cache.at(s);
++      if (threshold > max_threshold)
++        max_threshold = threshold;
++    }
++  }
++
++  return exists;
++}
++
++// Given a vector of state pointers, produce the next
++// subset of size r; return true if a new subset is yielded,
++// or false if all subsets are exhausted.
++bool next_subset(std::vector<std::uint32_t>& ptrs,
++                 const std::vector<std::uint32_t>& end_ptrs,
++                 uint32_t r) {
++  for (int i = r - 1; i > -1; i--) {
++    if (ptrs[i] < end_ptrs[i]) {
++      ptrs[i]++;
++      uint32_t moved = ptrs[i];
++      for (int j = i + 1; j < r; j++) {
++        ptrs[j] = moved + 1;
++        moved++;
++      }
++      return true;
++    }
++  }
++  return false;
++}
++
++// Generate all subsets of size r for a given vector of query
++// terms. Here, the terms are already mapped to integers.
++std::vector<std::string> gen_subsets(const std::vector<TermId>& terms,
++                                     std::uint32_t r) {
++  uint32_t n = terms.size();
++  std::vector<std::string> subsets;
++
++  if (r <= n && r > 0) {
++    std::vector<std::uint32_t> ptrs(r);
++    std::iota(std::begin(ptrs), std::end(ptrs), 0);
++
++    std::vector<std::uint32_t> end_ptrs(r);
++    std::iota(std::begin(end_ptrs), std::end(end_ptrs), n - r);
++
++    do {
++      std::string subset = std::to_string(terms[ptrs[0]]);
++
++      for (int i = 1; i < r; i++) {
++        subset += " " + std::to_string(terms[ptrs[i]]);
++      }
++      subsets.push_back(subset);
++
++    } while (next_subset(ptrs, end_ptrs, r));
++  }
++
++  return subsets;
++}
++
++// HR1 Policy
++// All queries are unique, so if you are given a 2-term query, you do not try
++// to find the 2-term pair in the cache, just each singleton term.
++Score get_threshold_hr1(const std::unordered_map<std::string, Score>& score_cache, const Query& query) {
++
++  // HR-1: Probe for triplets, pairs, and then terms.
++  // If we hit multiple in a group, we use the maximum.
++  // We return as soon as a group is hit and enumerated.
++  Score threshold = 0;
++  std::vector<TermId> tokens = query.term_ids();
++  size_t len_tokens = tokens.size();
++
++  // Try triplets
++  if (len_tokens > 3) {
++    // We hit, so we return
++    if (subset_max_exists(gen_subsets(tokens, 3), threshold, score_cache)) {
++      return threshold;
++    }
++  }
++
++  // Try pairs
++  if (len_tokens > 2) {
++    // We hit, so we return
++    if (subset_max_exists(gen_subsets(tokens, 2), threshold, score_cache))
++      return threshold;
++  }
++
++  // Try singles
++  if (len_tokens > 1) {
++    subset_max_exists(gen_subsets(tokens, 1), threshold, score_cache);
++  }
++  // Return what we found
++  return threshold;
++}
++
++// HR-2: Same as HR-1 but we do not back out once we hit the cache.
++Score get_threshold_hr2(const std::unordered_map<std::string, Score>& score_cache, const Query& query) {
++
++  Score threshold = 0;
++  std::vector<TermId> tokens = query.term_ids();
++  size_t len_tokens = tokens.size();
++
++  // Try triplets
++  if (len_tokens > 3) {
++    subset_max_exists(gen_subsets(tokens, 3), threshold, score_cache);
++  }
++
++  // Try pairs
++  if (len_tokens > 2) {
++    subset_max_exists(gen_subsets(tokens, 2), threshold, score_cache);
++  }
++
++  // Try singles
++  if (len_tokens > 1) {
++    subset_max_exists(gen_subsets(tokens, 1), threshold, score_cache);
++  }
++
++  // Return the largest we found
++  return threshold;
++}
++
++// HR-3: Only look at |q|-1 sized subsets.
++Score get_threshold_hr3(const std::unordered_map<std::string, Score>& score_cache, const Query& query) {
++  Score threshold = 0;
++  std::vector<TermId> tokens = query.term_ids();
++  size_t len_tokens = tokens.size();
++  subset_max_exists(gen_subsets(tokens, len_tokens - 1), threshold, score_cache);
++  return threshold;
++}
++
++// END Yafay and Altingovde Snippets **********************************************************************************
++
++// Offline Batch QP Structures here
++
++// Maps each subquery to the (index of) queries that contain it in the original input log
++struct subquery_mapping {
++  std::string subquery;
++  std::vector<size_t> indexes;
++
++  subquery_mapping() {}
++  subquery_mapping(std::string s, std::vector<size_t> idx) : subquery(s), indexes(idx) {}
++
++  std::vector<TermId> to_query() const {
++    std::stringstream ss(subquery);
++    std::vector<TermId> terms;
++    TermId term;
++    while (ss >> term) {
++      terms.push_back(term);
++    }
++    return terms;
++  }
++
++};
++
++// Core logic of the offline caching setup.
++// Walks the queries and finds a list of subqueries appearing more than f times.
++// This is the "generating" + "subquery to query mapping" + "filtering" steps
++// of the static caching approach
++std::vector<subquery_mapping> map_frequent_subqueries(std::vector<Query> const& queries, size_t f_cutoff) {
++
++  std::unordered_map<std::string, std::vector<size_t>> subquery_to_query;
++  std::vector<subquery_mapping> subquery_data;
++  size_t idx = 0;
++
++  // 1. Walk the queries and generate subqueries
++  for (auto const& query: queries) {
++    
++    auto query_terms = query.term_ids();
++    
++    // Singleton terms
++    auto subqueries = gen_subsets(query_terms, 1);
++    for (const auto& q : subqueries) {
++        subquery_to_query[q].push_back(idx);
++    }
++
++    // Pairs of terms
++    subqueries = gen_subsets(query_terms, 2);
++    for (const auto& q : subqueries) {
++        subquery_to_query[q].push_back(idx);
++    }
++
++    // Triplets of terms
++    subqueries = gen_subsets(query_terms, 3);
++    for (const auto& q : subqueries) {
++        subquery_to_query[q].push_back(idx);
++    }
++    
++    idx += 1;
++  }
++  
++  // Now we filter the subqueries of interest
++  for (auto& it: subquery_to_query) {
++    if (it.second.size() >= f_cutoff) {
++      subquery_data.emplace_back(it.first, it.second);
++    }
++  }
++
++  /* You can print stats if you like
++  // Stats
++  std::cerr << "Kept: " << subquery_data.size() << " subqueries\n";
++  size_t total = 0;
++  for (size_t i = 0; i < subquery_data.size(); ++i) {
++    total += subquery_data[i].indexes.size();
++  }
++  std::cerr << "Mapping to a total of " << total << " indexes\n";
++  */
++
++  return subquery_data;
++}
++
++
++// Default "query at a time" batch processing
++// Just run the queries in order they are given
++// This function also can implement either the clairvoyant
++// or the Q_k baseline by passing in an appropriate thresholds vector
++template <typename Fn>
++void process_query_at_a_time(
++    Fn query_func,
++    std::vector<Query> const& queries,
++    std::vector<Score> const& thresholds,
++    std::uint64_t k) {
++    
++    // Start the clock...
++    auto start = std::chrono::steady_clock::now();
++    
++    // For each query, process it
++    for (auto&& [query_idx, query]: enumerate(queries)) {
++        uint64_t result = query_func(query, thresholds[query_idx]);
++        do_not_optimize_away(result);
++    }
++    
++    auto end = std::chrono::steady_clock::now();
++    double batch_millisecs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
++    double batch_secs = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
++    
++    spdlog::info("---- qaat batch millisec = {} secs = {}", batch_millisecs, batch_secs); 
++}
++
++// Static caching approach (SC) - requires a threshold F to be provided
++template <typename Fn>
++void process_static_caching(
++    Fn query_func,
++    std::vector<Query> const& queries,
++    std::uint64_t k,
++    size_t f_cutoff) {
++    
++    // Start the clock...
++    auto start = std::chrono::steady_clock::now();
++   
++    // This maps queries (represented as strings) to thresholds    
++    std::vector<subquery_mapping> subqueries = map_frequent_subqueries(queries, f_cutoff);
++
++    auto stop_map = std::chrono::steady_clock::now();
++ 
++    // Set up thresholds for querying
++    std::vector<Score> sq_thresholds(queries.size(), 0);
++    for (auto const& sq : subqueries) {
++        // Build and run the subquery
++        Query q("", sq.to_query());
++        auto result = query_func(q, 0);
++        // Map this threshold back to the associated queries
++        for (auto const& i : sq.indexes) {
++            sq_thresholds[i] = std::max(sq_thresholds[i], result);
++        }
++    }
++
++    auto stop_threshold_gen = std::chrono::steady_clock::now();
++
++    // For each query, process it
++    for (auto&& [query_idx, query]: enumerate(queries)) {
++        // You could mix and match the query_func if you wanted (since
++        // we can assume subqueries are short, you might prefer to stick
++        // to BMW here for example)
++        uint64_t result = query_func(query, sq_thresholds[query_idx]);
++        do_not_optimize_away(result);
++    }
++    
++    auto end = std::chrono::steady_clock::now();
++    double batch_millisecs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
++    double batch_secs = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
++    
++    spdlog::info("---- static_cache batch millisec = {} secs = {}", batch_millisecs, batch_secs);
++
++    double mapping = std::chrono::duration_cast<std::chrono::milliseconds>(stop_map - start).count();
++    double subquery = std::chrono::duration_cast<std::chrono::milliseconds>(stop_threshold_gen - stop_map).count();
++
++    double query = std::chrono::duration_cast<std::chrono::milliseconds>(end - stop_threshold_gen).count();
++
++    spdlog::info("Breakdown (millisec): mapping = {} subquery processing = {} query processing = {}", mapping, subquery, query);
++}
++
++
++// The online dynamic caching algorithm
++// ASSUMPTION: The batch is already sorted in ascending order of query length, and
++// lexicographically within each length bucket. You can do this offline but it should
++// be counted towards the total latency.
++template <typename Fn>
++void process_dynamic_caching(
++    Fn query_func,
++    std::vector<Query> const& queries,
++    std::vector<Score> const& thresholds,
++    std::uint64_t k) {
++    
++    // Start the clock...
++    auto start = std::chrono::steady_clock::now();
++   
++    std::unordered_map<std::string, Score> score_cache;
++
++    // For each query, process it
++    for (auto&& [query_idx, query]: enumerate(queries)) {
++
++        // XXX: Change me to hr1 or hr3 if you prefer.
++        auto thresh = get_threshold_hr2(score_cache, query);
++        uint64_t result = query_func(query, thresh);
++        score_cache[query.to_string()] = result;
++        do_not_optimize_away(result);
++    }
++    
++    auto end = std::chrono::steady_clock::now();
++    double batch_millisecs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
++    double batch_secs = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
++    
++    spdlog::info("---- online_cache batch millisec = {} secs = {}", batch_millisecs, batch_secs); 
++}
++
++
++// Set up the performance test
++template <typename IndexType, typename WandType>
++void perftest(
++    IndexType const* index_ptr,
++    const std::optional<std::string>& wand_data_filename,
++    const std::vector<Query>& queries,
++    const std::optional<std::string>& thresholds_filename,
++    std::string const& type,
++    std::vector<std::string> const& query_types,
++    uint64_t k,
++    const ScorerParams& scorer_params,
++    size_t f_cutoff = 80
++) {
++    // Force unweighted queries due to assumption that batch contains unique queries, and each
++    // query contains only one instance of each term
++    bool weighted = false;
++    auto const& index = *index_ptr;
++    spdlog::info("Warming up posting lists...");
++    std::unordered_set<TermId> warmed_up;
++    for (auto const& q: queries) {
++        for (auto [t, _]: q.terms()) {
++            if (!warmed_up.count(t)) {
++                index.warmup(t);
++                warmed_up.insert(t);
++            }
++        }
++    }
++
++    WandType const wdata = [&] {
++        if (wand_data_filename) {
++            return WandType(MemorySource::mapped_file(*wand_data_filename));
++        }
++        return WandType{};
++    }();
++
++    std::vector<Score> thresholds(queries.size(), 0.0);
++    if (thresholds_filename) {
++        std::string t;
++        std::ifstream tin(*thresholds_filename);
++        size_t idx = 0;
++        while (std::getline(tin, t)) {
++            thresholds[idx] = std::stof(t);
++            idx += 1;
++        }
++        if (idx != queries.size()) {
++            throw std::invalid_argument("Invalid thresholds file.");
++        }
++    }
++
++    auto scorer = scorer::from_params(scorer_params, wdata);
++
++    for (const auto& t: query_types) {
++        auto valid_algorithms_it = pisa::arg::Algorithm::VALID_ALGORITHMS.find(t);
++        if (valid_algorithms_it == pisa::arg::Algorithm::VALID_ALGORITHMS.end()) {
++            spdlog::error("Unsupported query type: {}", t);
++            break;
++        }
++        if (valid_algorithms_it->second && !wand_data_filename) {
++            spdlog::error("Query type '{}' requires WAND data", t);
++            break;
++        }
++
++        std::function<Score(Query, Score)> query_fun;
++        if (t == "wand") {
++            query_fun = [&](Query query, Score threshold) {
++                topk_queue topk(k, threshold);
++                wand_query wand_q(topk);
++                wand_q(
++                    make_max_scored_cursors(index, wdata, *scorer, query, weighted), index.num_docs()
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "block_max_wand") {
++            query_fun = [&](Query query, Score threshold) {
++                topk_queue topk(k, threshold);
++                block_max_wand_query block_max_wand_q(topk);
++                block_max_wand_q(
++                    make_block_max_scored_cursors(index, wdata, *scorer, query, weighted),
++                    index.num_docs()
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "block_max_maxscore") {
++            query_fun = [&](Query query, Score threshold) {
++                topk_queue topk(k, threshold);
++                block_max_maxscore_query block_max_maxscore_q(topk);
++                block_max_maxscore_q(
++                    make_block_max_scored_cursors(index, wdata, *scorer, query, weighted),
++                    index.num_docs()
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "ranked_or") {
++            query_fun = [&](Query query, Score threshold) {
++                topk_queue topk(k, threshold);
++                ranked_or_query ranked_or_q(topk);
++                ranked_or_q(make_scored_cursors(index, *scorer, query, weighted), index.num_docs());
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "maxscore") {
++            query_fun = [&](Query query, Score threshold) {
++                topk_queue topk(k, threshold);
++                maxscore_query maxscore_q(topk);
++                maxscore_q(
++                    make_max_scored_cursors(index, wdata, *scorer, query, weighted), index.num_docs()
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "ranked_or_taat") {
++            SimpleAccumulator accumulator(index.num_docs());
++            topk_queue topk(k);
++            query_fun = [&, topk, accumulator](Query query, Score threshold) mutable {
++                ranked_or_taat_query ranked_or_taat_q(topk);
++                topk.clear(threshold);
++                ranked_or_taat_q(
++                    make_scored_cursors(index, *scorer, query, weighted), index.num_docs(), accumulator
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        } else if (t == "ranked_or_taat_lazy") {
++            LazyAccumulator<4> accumulator(index.num_docs());
++            topk_queue topk(k);
++            query_fun = [&, topk, accumulator](Query query, Score threshold) mutable {
++                ranked_or_taat_query ranked_or_taat_q(topk);
++                topk.clear(threshold);
++                ranked_or_taat_q(
++                    make_scored_cursors(index, *scorer, query, weighted), index.num_docs(), accumulator
++                );
++                auto thresh = topk.true_threshold();
++                topk.finalize();
++                return thresh;
++            };
++        }
++        
++        // We run all three - in reality, you should just run one of these for each
++        // experimental run, or you might advantage the second/third runs due to
++        // "warm up"
++        process_query_at_a_time(query_fun, queries, thresholds, k);
++
++        process_static_caching(query_fun, queries, k, f_cutoff);
++
++        process_dynamic_caching(query_fun, queries, thresholds, k); 
++
++    }
++}
++
++using wand_raw_index = wand_data<wand_data_raw>;
++using wand_uniform_index = wand_data<wand_data_compressed<>>;
++using wand_uniform_index_quantized = wand_data<wand_data_compressed<PayloadType::Quantized>>;
++
++int main(int argc, const char** argv) {
++    bool safe = false;
++    bool quantized = false;
++    size_t f_cutoff = 80;
++
++    App<arg::Index,
++        arg::WandData<arg::WandMode::Optional>,
++        arg::Query<arg::QueryMode::Ranked>,
++        arg::Algorithm,
++        arg::Scorer,
++        arg::Thresholds,
++        arg::LogLevel>
++        app{"Benchmarks batch processing queries on a given index."};
++    app.add_flag("--quantized", quantized, "Quantized scores");
++    app.add_option("--f", f_cutoff, "F, the number of queries a subquery must appear in to be used")
++        ->capture_default_str()
++        ->check(CLI::PositiveNumber);
++ 
++    CLI11_PARSE(app, argc, argv);
++
++    spdlog::set_default_logger(spdlog::stderr_color_mt("stderr"));
++    spdlog::set_level(app.log_level());
++
++    auto const& query_types = app.algorithms();
++
++    run_for_index(
++        app.index_encoding(), MemorySource::mapped_file(app.index_filename()), [&](auto index) {
++            using Index = std::decay_t<decltype(index)>;
++            auto params = std::make_tuple(
++                &index,
++                app.wand_data_path(),
++                app.queries(),
++                app.thresholds_file(),
++                app.index_encoding(),
++                query_types,
++                app.k(),
++                app.scorer_params(),
++                f_cutoff
++            );
++            if (app.is_wand_compressed()) {
++                if (quantized) {
++                    std::apply(perftest<Index, wand_uniform_index_quantized>, std::move(params));
++                } else {
++                    std::apply(perftest<Index, wand_uniform_index>, std::move(params));
++                }
++            } else {
++                std::apply(perftest<Index, wand_raw_index>, std::move(params));
++            }
++        }
++    );
++}
